@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#eee5d2">
+    <meta name="description" content="Danish Spit vs Mosquitoes — a tiny arcade survival game.">
+    <title>Danish Spit vs Mosquitoes</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Arial, Helvetica, sans-serif;
+        background: #eee5d2;
+        color: #19191c;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        padding: 18px 12px 24px;
+        display: flex;
+        justify-content: center;
+      }
+
+      main {
+        width: min(100%, 640px);
+        text-align: center;
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        color: #c9372e;
+        font-size: clamp(1.25rem, 5vw, 2rem);
+        line-height: 1.15;
+      }
+
+      canvas {
+        display: block;
+        width: 100%;
+        height: auto;
+        border: 2px solid rgba(25, 25, 28, .18);
+        border-radius: 12px;
+        box-shadow: 0 12px 35px rgba(48, 39, 20, .15);
+        touch-action: none;
+        cursor: crosshair;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 10px;
+        margin-top: 12px;
+      }
+
+      button {
+        min-height: 44px;
+        padding: 9px 16px;
+        border: 0;
+        border-radius: 10px;
+        background: #292a31;
+        color: white;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      button:hover { filter: brightness(1.12); }
+      button:focus-visible { outline: 3px solid #e24c3f; outline-offset: 3px; }
+
+      #start-button { background: #c9372e; }
+      #swat-button { background: #ad7b00; }
+
+      .help {
+        margin: 10px 0 0;
+        color: #4a453b;
+        font-size: .92rem;
+        line-height: 1.5;
+      }
+
+      #share-status {
+        min-height: 1.3em;
+        margin-top: 6px;
+        color: #4a453b;
+        font-size: .85rem;
+      }
+
+      @media (max-height: 850px) and (min-width: 700px) {
+        body { padding-top: 8px; }
+        h1 { margin-bottom: 6px; }
+        main { width: min(100%, calc((100vh - 125px) * .8421)); }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Danish Spit vs Mosquitoes</h1>
+      <canvas id="game" width="640" height="760" tabindex="0" aria-label="Arcade game. Click or tap to spit at mosquitoes; use the swat button to clear nearby mosquitoes."></canvas>
+      <div class="controls">
+        <button id="start-button" type="button">Start game</button>
+        <button id="swat-button" type="button" aria-label="Swat nearby mosquitoes">🪰 Swat</button>
+        <button id="mute-button" type="button" aria-pressed="false">Sound: On</button>
+        <button id="share-button" type="button">Share game</button>
+      </div>
+      <p class="help">Click or tap to spit · Right-click or tap <strong>Swat</strong> to clear a swarm · Press <strong>M</strong> to mute</p>
+      <div id="share-status" role="status" aria-live="polite"></div>
+    </main>
+    <script src="game.js" defer></script>
+  </body>
+</html>

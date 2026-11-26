@@ -1,0 +1,743 @@
+import os
+import sys
+import math
+import random
+import numpy as np
+import pygame
+from PIL import Image
+
+# --- BASE DIRECTORY (resolves files relative to danish.py) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def asset_path(filename):
+    return os.path.join(BASE_DIR, filename) if filename else ""
+
+
+# --- WINDOW & GAMEPLAY SETTINGS ---
+WIDTH, HEIGHT = 640, 760
+FPS = 60
+SPIT_SPEED = 14.0
+SPIT_HIT_RADIUS = 34
+SPIT_ANIM_DURATION = 0.28
+
+# ==============================================================================
+# PORTABLE ASSETS (all inside the same folder as danish.py)
+# ==============================================================================
+ASSETS = {
+    "images": {
+        "normal": asset_path("sree.png"),
+        "spit": asset_path("sree.png"),
+        "fallback_danish": asset_path("sree.png"),
+        "mosquito": "",
+        "spit_droplet": "",
+        "splat": "",
+        "background": "",
+    },
+    "sounds": {
+        "spit": asset_path("odada.mp3"),
+        "bite": asset_path("ayyo.mp3"),
+        "buzz": "",       # Built-in realistic mosquito buzz
+        "splat": "",      # Built-in cartoon splat
+        "swat": "",       # Built-in swat whoosh
+        "gameover": "",   # Built-in sad slide
+        "combo": [],
+    },
+}
+
+# Colors
+BG_TOP = (245, 240, 225)
+BG_BOTTOM = (218, 208, 184)
+WHITE = (255, 255, 255)
+BLACK = (25, 25, 28)
+RED = (225, 55, 45)
+GREEN = (55, 175, 75)
+GOLD = (245, 190, 35)
+SPIT_COLOR = (135, 225, 115)
+SPIT_OUTLINE = (42, 115, 48)
+MOSQUITO_BODY = (45, 40, 42)
+WING_COLOR = (220, 240, 255, 170)
+
+
+def _resample_lanczos():
+    return getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+
+
+def remove_white_sticker_bg(pil_img, threshold=238):
+    """Makes near-white sticker background pixels transparent and trims empty margins."""
+    rgba = pil_img.convert("RGBA")
+    arr = np.array(rgba, dtype=np.uint8)
+    r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
+    near_white = (r >= threshold) & (g >= threshold) & (b >= threshold)
+    arr[:, :, 3] = np.where(near_white, 0, a)
+    cleaned = Image.fromarray(arr, mode="RGBA")
+    bbox = cleaned.getbbox()
+    if bbox:
+        cleaned = cleaned.crop(bbox)
+    return cleaned
+
+
+def load_image_asset(primary_path, fallback_path="", target_size=None, clean_white_bg=True):
+    """Loads an image via Pillow if present, otherwise returns None."""
+    chosen = ""
+    if primary_path and os.path.exists(primary_path):
+        chosen = primary_path
+    elif fallback_path and os.path.exists(fallback_path):
+        chosen = fallback_path
+
+    if not chosen:
+        return None
+
+    try:
+        pil_img = Image.open(chosen)
+        if clean_white_bg:
+            pil_img = remove_white_sticker_bg(pil_img)
+        else:
+            pil_img = pil_img.convert("RGBA")
+        if target_size is not None:
+            pil_img = pil_img.resize(target_size, _resample_lanczos())
+        return pygame.image.fromstring(pil_img.tobytes(), pil_img.size, "RGBA").convert_alpha()
+    except Exception as e:
+        print(f"[!] Failed to load image '{chosen}' ({e}). Using fallback.")
+        return None
+
+
+def make_default_danish_surface(size=(136, 136)):
+    surf = pygame.Surface(size, pygame.SRCALPHA)
+    pygame.draw.circle(surf, (220, 180, 140), (size[0] // 2, size[1] // 2), size[0] // 2 - 4)
+    pygame.draw.circle(surf, BLACK, (size[0] // 2, size[1] // 2), size[0] // 2 - 4, 3)
+    return surf
+
+
+class SoundManager:
+    """Loads custom audio files (including MP3/WAV/OGG) with procedural fallbacks."""
+    def __init__(self, sound_paths):
+        self.enabled = False
+        self.buzz_channel = None
+        self.buzz_sound = None
+        self.spit_sound = None
+        self.splat_sound = None
+        self.swat_sound = None
+        self.bite_sound = None
+        self.gameover_sound = None
+        self.combo_sounds = []
+
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+            pygame.mixer.set_num_channels(12)
+            self.buzz_channel = pygame.mixer.Channel(0)
+
+            self.buzz_sound = self._load_sound(sound_paths.get("buzz", ""), self._make_realistic_buzz)
+            self.spit_sound = self._load_sound(sound_paths.get("spit", ""), self._make_meme_spit)
+            self.splat_sound = self._load_sound(sound_paths.get("splat", ""), self._make_meme_splat)
+            self.swat_sound = self._load_sound(sound_paths.get("swat", ""), self._make_swat_whoosh)
+            self.bite_sound = self._load_sound(sound_paths.get("bite", ""), self._make_meme_bite)
+            self.gameover_sound = self._load_sound(sound_paths.get("gameover", ""), self._make_sad_slide)
+
+            custom_combos = sound_paths.get("combo") or []
+            loaded_combos = [s for p in custom_combos if (s := self._try_load_file(p)) is not None]
+            self.combo_sounds = loaded_combos if loaded_combos else [
+                self._make_combo_ding(semitones=i * 2) for i in range(1, 9)
+            ]
+
+            self.enabled = True
+        except Exception as e:
+            print(f"[!] Audio disabled ({e})")
+
+    def _try_load_file(self, path):
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            return pygame.mixer.Sound(path)
+        except Exception as e:
+            print(f"[!] Could not load sound '{path}' ({e}). Using fallback.")
+            return None
+
+    def _load_sound(self, path, fallback_fn):
+        loaded = self._try_load_file(path)
+        return loaded if loaded is not None else fallback_fn()
+
+    def _play_sfx(self, sound_obj, volume=1.0):
+        if not self.enabled or sound_obj is None:
+            return
+        channel = pygame.mixer.find_channel(True)
+        if channel is not None:
+            channel.set_volume(max(0.0, min(1.0, volume)))
+            channel.play(sound_obj)
+
+    def _to_sound(self, samples):
+        clipped = np.clip(samples, -1.0, 1.0)
+        pcm = (clipped * 32767).astype(np.int16)
+        return pygame.mixer.Sound(buffer=pcm.tobytes())
+
+    def _make_realistic_buzz(self, sr=22050, duration=1.5):
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        drift1 = 22.0 * np.sin(2 * np.pi * 2.3 * t) + 9.0 * np.sin(2 * np.pi * 6.8 * t)
+        drift2 = 26.0 * np.cos(2 * np.pi * 3.1 * t) + 11.0 * np.sin(2 * np.pi * 8.4 * t)
+        f1 = 490.0 + drift1
+        f2 = 528.0 + drift2
+        p1 = 2 * np.pi * np.cumsum(f1) / sr
+        p2 = 2 * np.pi * np.cumsum(f2) / sr
+
+        m1 = (
+            0.55 * np.sin(p1)
+            + 0.30 * np.sin(2 * p1 + 0.4)
+            + 0.16 * np.sin(3 * p1 + 1.1)
+            + 0.08 * np.sin(4 * p1)
+        )
+        m2 = (
+            0.45 * np.sin(p2)
+            + 0.22 * np.sin(2 * p2 + 0.8)
+            + 0.10 * np.sin(3 * p2)
+        )
+        flutter = 0.78 + 0.22 * np.sin(2 * np.pi * 38.0 * t + 0.5 * np.sin(2 * np.pi * 5.0 * t))
+        rng = np.random.default_rng(101)
+        air = rng.normal(0.0, 0.025, size=len(t))
+        return self._to_sound(((m1 + 0.75 * m2) * flutter + air) * 0.28)
+
+    def _make_meme_spit(self, sr=22050):
+        duration = 0.13
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        rng = np.random.default_rng(19)
+        spit_puff = rng.uniform(-1.0, 1.0, size=len(t)) * np.exp(-32 * t) * 0.55
+        freq = 280.0 + 520.0 * np.sin(np.pi * (t / duration))
+        boing = np.sin(2 * np.pi * np.cumsum(freq) / sr) * np.exp(-18 * t) * 0.45
+        return self._to_sound(spit_puff + boing)
+
+    def _make_meme_splat(self, sr=22050):
+        duration = 0.16
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        rng = np.random.default_rng(42)
+        squish = rng.uniform(-1.0, 1.0, size=len(t)) * np.sin(np.pi * (t / duration)) * 0.65
+        pop_freq = 420.0 * np.exp(-12 * t) + 95.0
+        pop = np.sin(2 * np.pi * np.cumsum(pop_freq) / sr) * np.exp(-20 * t) * 0.55
+        return self._to_sound(squish + pop)
+
+    def _make_swat_whoosh(self, sr=22050):
+        duration = 0.09
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        rng = np.random.default_rng(7)
+        whoosh = rng.uniform(-1.0, 1.0, size=len(t)) * np.exp(-35 * t) * 0.35
+        return self._to_sound(whoosh)
+
+    def _make_meme_bite(self, sr=22050):
+        duration = 0.24
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        freq = 210.0 - 115.0 * (t / duration)
+        saw_like = (
+            0.65 * np.sin(2 * np.pi * np.cumsum(freq) / sr)
+            + 0.25 * np.sin(4 * np.pi * np.cumsum(freq) / sr)
+        )
+        env = np.minimum(1.0, t / 0.015) * np.exp(-8.5 * t)
+        return self._to_sound(saw_like * env * 0.55)
+
+    def _make_combo_ding(self, semitones=2, sr=22050):
+        duration = 0.11
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        base_f = 523.25 * (2.0 ** (semitones / 12.0))
+        tone = 0.65 * np.sin(2 * np.pi * base_f * t) + 0.35 * np.sin(2 * np.pi * base_f * 1.5 * t)
+        env = np.exp(-24 * t)
+        return self._to_sound(tone * env * 0.35)
+
+    def _make_sad_slide(self, sr=22050):
+        duration = 0.65
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        step = np.floor(np.clip(t / 0.15, 0, 3))
+        slide = 311.13 * (0.89 ** (step * 1.6 + (t % 0.15) * 2.2))
+        brass = (
+            0.55 * np.sin(2 * np.pi * np.cumsum(slide) / sr)
+            + 0.28 * np.sin(4 * np.pi * np.cumsum(slide) / sr)
+            + 0.12 * np.sin(6 * np.pi * np.cumsum(slide) / sr)
+        )
+        env = np.minimum(1.0, t / 0.03) * np.exp(-2.2 * t)
+        return self._to_sound(brass * env * 0.45)
+
+    def update_buzz(self, active, mosquito_count, closest_ratio=0.5):
+        if not self.enabled or self.buzz_channel is None:
+            return
+        if not active or mosquito_count <= 0:
+            self.buzz_channel.stop()
+            return
+
+        if not self.buzz_channel.get_busy():
+            self.buzz_channel.play(self.buzz_sound, loops=-1)
+
+        count_factor = min(1.0, mosquito_count / 5.0)
+        proximity_factor = max(0.25, min(1.0, closest_ratio))
+        vol = min(0.9, (0.22 + 0.48 * count_factor) * proximity_factor)
+        self.buzz_channel.set_volume(vol)
+
+    def play_spit(self):
+        self._play_sfx(self.spit_sound, volume=1.0)
+
+    def play_splat(self, combo=1):
+        if not self.enabled:
+            return
+        self._play_sfx(self.splat_sound, volume=0.95)
+        if combo >= 2 and self.combo_sounds:
+            idx = min(combo - 2, len(self.combo_sounds) - 1)
+            self._play_sfx(self.combo_sounds[idx], volume=0.85)
+
+    def play_swat(self):
+        self._play_sfx(self.swat_sound, volume=0.8)
+
+    def play_bite(self):
+        self._play_sfx(self.bite_sound, volume=1.0)
+
+    def play_gameover(self):
+        self._play_sfx(self.gameover_sound, volume=1.0)
+
+    def stop_all(self):
+        if self.enabled:
+            pygame.mixer.stop()
+
+
+def draw_default_background(surface):
+    for y in range(HEIGHT):
+        t = y / HEIGHT
+        r = int(BG_TOP[0] * (1 - t) + BG_BOTTOM[0] * t)
+        g = int(BG_TOP[1] * (1 - t) + BG_BOTTOM[1] * t)
+        b = int(BG_TOP[2] * (1 - t) + BG_BOTTOM[2] * t)
+        pygame.draw.line(surface, (r, g, b), (0, y), (WIDTH, y))
+
+    for x in range(0, WIDTH, 40):
+        pygame.draw.line(surface, (205, 195, 170), (x, 0), (x, HEIGHT), 1)
+    for y in range(0, HEIGHT, 40):
+        pygame.draw.line(surface, (205, 195, 170), (0, y), (WIDTH, y), 1)
+
+
+class SpitProjectile:
+    def __init__(self, start_x, start_y, target_x, target_y, sprite=None):
+        self.x = start_x
+        self.y = start_y
+        dx = target_x - start_x
+        dy = target_y - start_y
+        dist = math.hypot(dx, dy) + 1e-5
+        self.vx = (dx / dist) * SPIT_SPEED
+        self.vy = (dy / dist) * SPIT_SPEED
+        self.angle = math.atan2(dy, dx)
+        self.sprite = sprite
+        self.trail = []
+
+    def update(self):
+        self.trail.append((self.x, self.y))
+        if len(self.trail) > 5:
+            self.trail.pop(0)
+        self.x += self.vx
+        self.y += self.vy
+
+    def offscreen(self):
+        return self.x < -40 or self.x > WIDTH + 40 or self.y < -40 or self.y > HEIGHT + 40
+
+    def draw(self, surface):
+        for idx, (tx, ty) in enumerate(self.trail):
+            rad = max(2, int((idx + 1) * 1.4))
+            pygame.draw.circle(surface, SPIT_COLOR, (int(tx), int(ty)), rad)
+
+        if self.sprite is not None:
+            rotated = pygame.transform.rotate(self.sprite, -math.degrees(self.angle))
+            rect = rotated.get_rect(center=(int(self.x), int(self.y)))
+            surface.blit(rotated, rect.topleft)
+            return
+
+        blob_surf = pygame.Surface((28, 18), pygame.SRCALPHA)
+        pygame.draw.ellipse(blob_surf, SPIT_COLOR, (3, 3, 22, 12))
+        pygame.draw.ellipse(blob_surf, SPIT_OUTLINE, (3, 3, 22, 12), 2)
+        pygame.draw.circle(blob_surf, WHITE, (18, 7), 2)
+        rotated = pygame.transform.rotate(blob_surf, -math.degrees(self.angle))
+        rect = rotated.get_rect(center=(int(self.x), int(self.y)))
+        surface.blit(rotated, rect.topleft)
+
+
+class Mosquito:
+    def __init__(self, target_x, target_y, speed_mult=1.0, sprite=None):
+        side = random.choice(["top", "left", "right", "bottom"])
+        if side == "top":
+            self.x = random.uniform(30, WIDTH - 30)
+            self.y = -25
+        elif side == "bottom":
+            self.x = random.uniform(30, WIDTH - 30)
+            self.y = HEIGHT + 25
+        elif side == "left":
+            self.x = -25
+            self.y = random.uniform(60, HEIGHT - 60)
+        else:
+            self.x = WIDTH + 25
+            self.y = random.uniform(60, HEIGHT - 60)
+
+        self.target_x = target_x
+        self.target_y = target_y
+        self.speed = random.uniform(1.4, 2.5) * speed_mult
+        self.phase = random.uniform(0, math.tau)
+        self.radius = 18
+        self.sprite = sprite
+
+    def update(self, dt_sec):
+        self.phase += dt_sec * 16.0
+        dx = self.target_x - self.x
+        dy = self.target_y - self.y
+        dist = math.hypot(dx, dy) + 1e-5
+        nx, ny = dx / dist, dy / dist
+        perp_x, perp_y = -ny, nx
+        weave = math.sin(self.phase * 0.45) * 1.35
+        self.x += nx * self.speed + perp_x * weave * 0.45
+        self.y += ny * self.speed + perp_y * weave * 0.45
+
+    def draw(self, surface):
+        if self.sprite is not None:
+            wobble = math.sin(self.phase * 1.4) * 12
+            rotated = pygame.transform.rotate(self.sprite, wobble)
+            rect = rotated.get_rect(center=(int(self.x), int(self.y)))
+            surface.blit(rotated, rect.topleft)
+            return
+
+        wing_flap = math.sin(self.phase * 2.2) * 7
+        wing_surf = pygame.Surface((64, 44), pygame.SRCALPHA)
+        pygame.draw.ellipse(wing_surf, WING_COLOR, (8, 4 - wing_flap * 0.3, 18, 12))
+        pygame.draw.ellipse(wing_surf, WING_COLOR, (38, 4 - wing_flap * 0.3, 18, 12))
+        surface.blit(wing_surf, (int(self.x - 32), int(self.y - 22)))
+
+        pygame.draw.ellipse(surface, MOSQUITO_BODY, (int(self.x - 10), int(self.y - 6), 20, 12))
+        pygame.draw.circle(surface, MOSQUITO_BODY, (int(self.x + 10), int(self.y - 2)), 5)
+        pygame.draw.line(surface, BLACK, (int(self.x + 14), int(self.y - 2)), (int(self.x + 23), int(self.y + 1)), 2)
+        for lx in (-5, 0, 5):
+            pygame.draw.line(surface, BLACK, (int(self.x + lx), int(self.y + 5)), (int(self.x + lx - 5), int(self.y + 14)), 1)
+            pygame.draw.line(surface, BLACK, (int(self.x + lx), int(self.y - 5)), (int(self.x + lx + 5), int(self.y - 13)), 1)
+
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("DANISH SPIT VS MOSQUITOES - Arcade Game")
+    clock = pygame.time.Clock()
+
+    img_paths = ASSETS["images"]
+    sound = SoundManager(ASSETS["sounds"])
+
+    font_title = pygame.font.SysFont("arial", 32, bold=True)
+    font_score = pygame.font.SysFont("arial", 42, bold=True)
+    font_med = pygame.font.SysFont("arial", 20, bold=True)
+    font_small = pygame.font.SysFont("arial", 15, bold=True)
+
+    custom_bg = load_image_asset(
+        img_paths.get("background", ""),
+        target_size=(WIDTH, HEIGHT),
+        clean_white_bg=False,
+    )
+    if custom_bg is not None:
+        bg_surface = custom_bg.convert()
+    else:
+        bg_surface = pygame.Surface((WIDTH, HEIGHT))
+        draw_default_background(bg_surface)
+
+    fallback_danish = img_paths.get("fallback_danish", "")
+    normal_sprite = load_image_asset(
+        img_paths.get("normal", ""),
+        fallback_path=fallback_danish,
+        target_size=(136, 136),
+        clean_white_bg=True,
+    ) or make_default_danish_surface((136, 136))
+
+    spit_sprite = load_image_asset(
+        img_paths.get("spit", ""),
+        fallback_path=img_paths.get("normal", "") or fallback_danish,
+        target_size=(136, 136),
+        clean_white_bg=True,
+    ) or normal_sprite
+
+    mosquito_sprite = load_image_asset(
+        img_paths.get("mosquito", ""),
+        target_size=(42, 42),
+        clean_white_bg=True,
+    )
+    spit_droplet_sprite = load_image_asset(
+        img_paths.get("spit_droplet", ""),
+        target_size=(28, 18),
+        clean_white_bg=True,
+    )
+    splat_sprite = load_image_asset(
+        img_paths.get("splat", ""),
+        target_size=(48, 48),
+        clean_white_bg=True,
+    )
+
+    center_x, center_y = WIDTH // 2, HEIGHT // 2 + 40
+
+    state = "START"
+    score = 0
+    best_score = 0
+    hp = 100
+    combo = 0
+    danish_shake = 0.0
+    danish_scale = 1.0
+    spit_anim_timer = 0.0
+    muted = False
+
+    spits = []
+    mosquitoes = []
+    splats = []
+    popups = []
+    splash_rings = []
+    spawn_timer = 0.0
+
+    def reset_game():
+        nonlocal score, hp, combo, danish_shake, danish_scale, spit_anim_timer
+        nonlocal spits, mosquitoes, splats, popups, splash_rings, spawn_timer
+        score = 0
+        hp = 100
+        combo = 0
+        danish_shake = 0.0
+        danish_scale = 1.0
+        spit_anim_timer = 0.0
+        spits = []
+        mosquitoes = []
+        splats = []
+        popups = []
+        splash_rings = []
+        spawn_timer = 0.0
+
+    def fire_spit(tx, ty):
+        nonlocal danish_scale, spit_anim_timer
+        angle = math.atan2(ty - (center_y + 12), tx - center_x)
+        mouth_x = center_x + math.cos(angle) * 28
+        mouth_y = center_y + 12 + math.sin(angle) * 24
+        spits.append(SpitProjectile(mouth_x, mouth_y, tx, ty, sprite=spit_droplet_sprite))
+        danish_scale = 1.14
+        spit_anim_timer = SPIT_ANIM_DURATION
+        sound.play_spit()
+
+    def trigger_swat(sx, sy, radius=68):
+        nonlocal score, best_score, combo, danish_scale
+        splash_rings.append([sx, sy, radius, 210, (255, 220, 60)])
+        danish_scale = 1.12
+
+        killed_this_swat = 0
+        for m in mosquitoes[:]:
+            if math.hypot(m.x - sx, m.y - sy) <= radius + m.radius:
+                mosquitoes.remove(m)
+                killed_this_swat += 1
+                splats.append([m.x, m.y, 210, random.randint(14, 22)])
+
+        if killed_this_swat > 0:
+            combo += killed_this_swat
+            pts = killed_this_swat * (10 + min(combo * 2, 30))
+            score += pts
+            best_score = max(best_score, score)
+            sound.play_splat(combo=combo)
+            label = f"+{pts}!" if combo < 2 else f"+{pts} (x{combo} COMBO!)"
+            popups.append([sx, sy - 10, label, 255])
+        else:
+            sound.play_swat()
+            combo = 0
+
+    running = True
+    while running:
+        dt_ms = clock.tick(FPS)
+        dt_sec = dt_ms / 1000.0
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_m:
+                    muted = not muted
+                    if muted:
+                        sound.stop_all()
+                elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                    if state in ("START", "GAMEOVER"):
+                        reset_game()
+                        state = "PLAYING"
+                    elif state == "PLAYING":
+                        mx, my = pygame.mouse.get_pos()
+                        fire_spit(mx, my)
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    if state in ("START", "GAMEOVER"):
+                        reset_game()
+                        state = "PLAYING"
+                    elif state == "PLAYING":
+                        fire_spit(event.pos[0], event.pos[1])
+                elif event.button == 3 and state == "PLAYING":
+                    trigger_swat(event.pos[0], event.pos[1], radius=68)
+
+        danish_shake = max(0.0, danish_shake - dt_sec * 35.0)
+        danish_scale += (1.0 - danish_scale) * min(1.0, dt_sec * 12.0)
+        spit_anim_timer = max(0.0, spit_anim_timer - dt_sec)
+
+        closest_ratio = 0.4
+        if state == "PLAYING":
+            difficulty = 1.0 + min(score / 450.0, 1.6)
+            spawn_interval = max(0.28, 1.05 / difficulty)
+            spawn_timer += dt_sec
+            if spawn_timer >= spawn_interval:
+                spawn_timer = 0.0
+                count = 2 if score > 250 and random.random() < 0.35 else 1
+                for _ in range(count):
+                    mosquitoes.append(Mosquito(center_x, center_y, speed_mult=difficulty, sprite=mosquito_sprite))
+
+            for sp in spits[:]:
+                sp.update()
+                hit_mosquito = None
+                for m in mosquitoes:
+                    if math.hypot(m.x - sp.x, m.y - sp.y) <= SPIT_HIT_RADIUS + m.radius:
+                        hit_mosquito = m
+                        break
+
+                if hit_mosquito is not None:
+                    mosquitoes.remove(hit_mosquito)
+                    if sp in spits:
+                        spits.remove(sp)
+                    combo += 1
+                    pts = 10 + min(combo * 2, 30)
+                    score += pts
+                    best_score = max(best_score, score)
+                    splats.append([hit_mosquito.x, hit_mosquito.y, 210, random.randint(14, 22)])
+                    splash_rings.append([hit_mosquito.x, hit_mosquito.y, 14, 220, SPIT_COLOR])
+                    sound.play_splat(combo=combo)
+                    label = f"SPIT +{pts}!" if combo < 2 else f"SPIT +{pts} (x{combo}!)"
+                    popups.append([hit_mosquito.x, hit_mosquito.y - 12, label, 255])
+                elif sp.offscreen():
+                    spits.remove(sp)
+
+            min_dist = 9999.0
+            for m in mosquitoes[:]:
+                m.update(dt_sec)
+                d = math.hypot(m.x - center_x, m.y - center_y)
+                min_dist = min(min_dist, d)
+                if d < 42:
+                    mosquitoes.remove(m)
+                    hp = max(0, hp - 12)
+                    combo = 0
+                    danish_shake = 9.0
+                    sound.play_bite()
+                    popups.append([center_x, center_y - 50, "AYYO! -12 HP", 255])
+                    if hp <= 0:
+                        state = "GAMEOVER"
+                        sound.stop_all()
+                        sound.play_gameover()
+
+            if mosquitoes:
+                closest_ratio = 1.0 - min(0.85, min_dist / 420.0)
+
+        sound.update_buzz(
+            active=(state == "PLAYING" and not muted),
+            mosquito_count=len(mosquitoes),
+            closest_ratio=closest_ratio,
+        )
+
+        for s in splats[:]:
+            s[2] -= 2.2
+            if s[2] <= 0:
+                splats.remove(s)
+
+        for ring in splash_rings[:]:
+            ring[2] += 3.8
+            ring[3] -= 15
+            if ring[3] <= 0:
+                splash_rings.remove(ring)
+
+        for pop in popups[:]:
+            pop[1] -= 1.2
+            pop[3] -= 5
+            if pop[3] <= 0:
+                popups.remove(pop)
+
+        # --- RENDER ---
+        screen.blit(bg_surface, (0, 0))
+
+        for sx, sy, alpha, rad in splats:
+            if splat_sprite is not None:
+                s_copy = splat_sprite.copy()
+                s_copy.set_alpha(max(0, int(alpha)))
+                s_rect = s_copy.get_rect(center=(int(sx), int(sy)))
+                screen.blit(s_copy, s_rect.topleft)
+            else:
+                splat_surf = pygame.Surface((rad * 3, rad * 3), pygame.SRCALPHA)
+                pygame.draw.circle(splat_surf, (130, 20, 20, max(0, int(alpha))), (rad * 1.5, rad * 1.5), rad)
+                pygame.draw.circle(splat_surf, (175, 35, 35, max(0, int(alpha * 0.8))), (rad * 1.5 + 6, rad * 1.5 - 4), rad // 2)
+                screen.blit(splat_surf, (int(sx - rad * 1.5), int(sy - rad * 1.5)))
+
+        active_sprite = spit_sprite if spit_anim_timer > 0.0 else normal_sprite
+        hover_y = center_y + (math.sin(pygame.time.get_ticks() * 0.006) * 5 if state == "START" else 0)
+        shake_x = random.uniform(-danish_shake, danish_shake)
+        shake_y = random.uniform(-danish_shake, danish_shake)
+        sz = int(136 * danish_scale)
+        sprite_scaled = pygame.transform.smoothscale(active_sprite, (sz, sz))
+        rect = sprite_scaled.get_rect(center=(int(center_x + shake_x), int(hover_y + shake_y)))
+        screen.blit(sprite_scaled, rect.topleft)
+
+        for sp in spits:
+            sp.draw(screen)
+
+        for m in mosquitoes:
+            m.draw(screen)
+
+        for sx, sy, rad, alpha, col in splash_rings:
+            r_surf = pygame.Surface((int(rad * 2 + 8), int(rad * 2 + 8)), pygame.SRCALPHA)
+            pygame.draw.circle(
+                r_surf,
+                (col[0], col[1], col[2], max(0, int(alpha))),
+                (int(rad + 4), int(rad + 4)),
+                int(rad),
+                4,
+            )
+            screen.blit(r_surf, (int(sx - rad - 4), int(sy - rad - 4)))
+
+        for px, py, text, alpha in popups:
+            col = RED if "AYYO" in text else BLACK
+            txt_surf = font_small.render(text, True, col)
+            txt_surf.set_alpha(max(0, int(alpha)))
+            screen.blit(txt_surf, (int(px - txt_surf.get_width() // 2), int(py)))
+
+        pygame.draw.rect(screen, (30, 32, 38), (18, 16, 210, 26), border_radius=8)
+        hp_w = int((hp / 100.0) * 202)
+        hp_col = GREEN if hp > 50 else (GOLD if hp > 25 else RED)
+        if hp_w > 0:
+            pygame.draw.rect(screen, hp_col, (22, 20, hp_w, 18), border_radius=6)
+        hp_label = font_small.render(f"HP: {hp}/100", True, WHITE)
+        screen.blit(hp_label, (28, 21))
+
+        mute_label = font_small.render(f"[M] Sound: {'OFF' if muted else 'ON'}", True, BLACK)
+        screen.blit(mute_label, (20, 48))
+
+        score_surf = font_score.render(str(score), True, BLACK)
+        screen.blit(score_surf, (WIDTH - score_surf.get_width() - 24, 10))
+
+        if state == "PLAYING":
+            mx, my = pygame.mouse.get_pos()
+            pygame.draw.circle(screen, SPIT_OUTLINE, (mx, my), 15, 2)
+            pygame.draw.circle(screen, SPIT_COLOR, (mx, my), 4)
+
+        if state == "START":
+            title = font_title.render("DANISH SPIT VS MOSQUITOES", True, RED)
+            sub1 = font_med.render("Left-Click (or SPACE) to SPIT at mosquitoes!", True, BLACK)
+            sub2 = font_small.render("Right-Click to Swat  |  Press M to Mute Sound", True, BLACK)
+            screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 76))
+            screen.blit(sub1, (WIDTH // 2 - sub1.get_width() // 2, HEIGHT - 110))
+            screen.blit(sub2, (WIDTH // 2 - sub2.get_width() // 2, HEIGHT - 78))
+
+        elif state == "GAMEOVER":
+            card = pygame.Rect(90, 200, WIDTH - 180, 270)
+            pygame.draw.rect(screen, WHITE, card, border_radius=16)
+            pygame.draw.rect(screen, BLACK, card, 4, border_radius=16)
+
+            go_txt = font_title.render("SWARM OVERWHELMED!", True, RED)
+            sc_txt = font_med.render(f"Score: {score}   |   Best: {best_score}", True, BLACK)
+            re_txt = font_med.render("Click or Press SPACE to Play Again", True, GREEN)
+
+            screen.blit(go_txt, (WIDTH // 2 - go_txt.get_width() // 2, 228))
+            screen.blit(sc_txt, (WIDTH // 2 - sc_txt.get_width() // 2, 295))
+            screen.blit(re_txt, (WIDTH // 2 - re_txt.get_width() // 2, 385))
+
+        pygame.display.flip()
+
+    sound.stop_all()
+    pygame.quit()
+    sys.exit()
+
+
+if __name__ == "__main__":
+    main()
